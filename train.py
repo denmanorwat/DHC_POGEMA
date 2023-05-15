@@ -16,7 +16,7 @@ random.seed(0)
 
 
 def main(num_actors=configs.num_actors, log_interval=configs.log_interval):
-    ray.init()
+    ray.init(include_dashboard=False)
 
     buffer = GlobalBuffer.remote()
     learner = Learner.remote(buffer)
