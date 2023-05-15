@@ -10,10 +10,13 @@ class DHC_wrapper(Pogema):
                 STAY = i
                 break
         self.STAY = STAY
+        self.num_agents = self.pogema_env.get_num_agents()
+        self.map_size = self.pogema_env.grid_config.size
+        self.steps = 0
     
     def get_heuri_map(self):
-        num_agents = self.pogema_env.get_num_agents()
-        map_size = self.pogema_env.grid_config.size
+        num_agents = self.num_agents
+        map_size = self.map_size
         dist_map = np.ones((num_agents, *map_size), dtype=np.int32) * 2147483647
         goal_pos = self.pogema_env.grid_config.get_targets_xy()
         obstacles = self.pogema_env.grid.get_obstacles()
@@ -81,7 +84,7 @@ class DHC_wrapper(Pogema):
 
 
     def step(self, actions):
-        num_agents = self.pogema_env.get_num_agents()
+        num_agents = self.num_agents
         obs_radius = self.pogema_env.grid_config.obs_radius
         prev_pos = self.pogema_env.get_agents_xy()
         _, rewards, _, _ = self.pogema_env.step(actions)
@@ -118,9 +121,9 @@ class DHC_wrapper(Pogema):
         return self.observe(), rewards, done, info
 
     def observe(self):
-        num_agents = self.pogema_env.get_num_agents()
+        num_agents = self.num_agents
         obs_radius = self.pogema_env.grid_config.obs_radius
-        map_size = self.pogema_env.grid_config.size
+        map_size = self.map_size
         agent_pos = self.pogema_env.get_agents_xy()
 
         obs = np.zeros((num_agents, 6, 2*obs_radius+1, 2*obs_radius+1), dtype=np.bool)
@@ -146,6 +149,7 @@ class DHC_wrapper(Pogema):
         return self.pogema_env.render(mode)
     
     def reset(self, seed):
+        self.steps=0
         self.pogema_env.reset(seed)
     
     

@@ -13,8 +13,12 @@ from torch.cuda.amp import GradScaler
 import numpy as np
 from model import Network
 from environment import Environment
+from DHC_wrapper import DHC_wrapper
 from buffer import SumTree, LocalBuffer
 import configs
+from pogema import pogema_v0, Easy16x16
+
+
 
 @ray.remote(num_cpus=1)
 class GlobalBuffer:
@@ -373,7 +377,9 @@ class Actor:
         self.id = worker_id
         self.model = Network()
         self.model.eval()
-        self.env = Environment(curriculum=True)
+        pogema_env = pogema_v0(grid_config = Easy16x16())
+        # TEMPORARY: NO CURRICULUM
+        self.env = DHC_wrapper(pogema_env)
         self.epsilon = epsilon
         self.learner = learner
         self.global_buffer = buffer
@@ -423,8 +429,9 @@ class Actor:
         weights = ray.get(weights_id)
         self.model.load_state_dict(weights)
         # update environment settings set (number of agents and map size)
-        new_env_settings_set = ray.get(self.global_buffer.get_env_settings.remote())
-        self.env.update_env_settings_set(ray.get(new_env_settings_set))
+        # TEMPORARY!
+        # new_env_settings_set = ray.get(self.global_buffer.get_env_settings.remote())
+        # self.env.update_env_settings_set(ray.get(new_env_settings_set))
     
     def reset(self):
         self.model.reset()

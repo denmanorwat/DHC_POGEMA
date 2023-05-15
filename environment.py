@@ -7,6 +7,7 @@ from matplotlib import colors
 import configs
 
 
+
 action_list = np.array([[0, 0],[-1, 0],[1, 0],[0, -1],[0, 1]], dtype=np.int)
 
 color_map = np.array([[255, 255, 255],   # white
