@@ -1,3 +1,5 @@
 __pycache__
 .vscode
 videos/*
+wandb/
+distance_heatmap/

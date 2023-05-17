@@ -8,6 +8,7 @@ import ray
 
 from worker import GlobalBuffer, Learner, Actor
 import configs
+import wandb
 
 os.environ["OMP_NUM_THREADS"] = "1"
 torch.manual_seed(0)

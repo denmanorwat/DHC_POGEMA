@@ -6,7 +6,7 @@ communication = False
 ####################    environment     ####################
 ############################################################
 map_length = 50
-num_agents = 2
+num_agents = 4
 obs_radius = 4
 reward_fn = dict(move=-0.075,
                 stay_on_goal=0,
@@ -56,7 +56,7 @@ prioritized_replay_beta=0.4
 
 # curriculum learning
 init_env_settings = (1, 10)
-max_num_agents = 2
+max_num_agents = 4
 max_map_lenght = 40
 pass_rate = 0.9
 

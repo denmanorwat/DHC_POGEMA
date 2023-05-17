@@ -13,18 +13,46 @@ from torch.cuda.amp import GradScaler
 import numpy as np
 from model import Network
 from environment import Environment
-from DHC_wrapper import DHC_wrapper
+from DHC_wrapper import DHC_wrapper, INFINITY
 from buffer import SumTree, LocalBuffer
 import configs
-from pogema import pogema_v0, Easy16x16
+from pogema import pogema_v0, Easy16x16, Normal8x8, Hard8x8
+import wandb
+import cv2
+import seaborn as sns
 
+def draw_layout(obstacles, agents_pos, goals_pos):
+    layout = np.expand_dims(obstacles.copy(), axis=-1)
+    layout = np.tile(layout.copy(), (1, 1, 3)).astype(np.float32)
+    for i in range(obstacles.shape[0]):
+        for j in range(obstacles.shape[1]):
+            if obstacles[i, j] == 1:
+                layout[i, j, :] = np.zeros(3)
+            else:
+                layout[i, j, :] = np.array([0, 0, 1.])
+    h = np.linspace(60, 300, len(agents_pos))
+    counter = 0
+    for agent, goal in zip(agents_pos, goals_pos):
+        layout[agent[0], agent[1], :] = np.array([h[counter], 1., 1.])
+        layout[goal[0], goal[1], :] = np.array([h[counter], 0.5, 0.5])
+        counter += 1
+    layout = cv2.cvtColor(layout, cv2.COLOR_HSV2BGR)
+    return layout
 
+def draw_distance(prefix, distance_maps):
+    for i, dist_map in enumerate(distance_maps):
+        mask = (dist_map==INFINITY)
+        fig = sns.heatmap(dist_map, mask=mask).get_figure()
+        fig.savefig(prefix+"/Dist map of agent {}".format(i))
+        fig.clf()
 
 @ray.remote(num_cpus=1)
 class GlobalBuffer:
     def __init__(self, episode_capacity=configs.episode_capacity, local_buffer_capacity=configs.max_episode_length,
                 init_env_settings=configs.init_env_settings, max_comm_agents=configs.max_comm_agents,
                 alpha=configs.prioritized_replay_alpha, beta=configs.prioritized_replay_beta):
+        
+        wandb.init()
 
         self.capacity = episode_capacity
         self.local_buffer_capacity = local_buffer_capacity
@@ -50,6 +78,12 @@ class GlobalBuffer:
         self.size_buf = np.zeros(episode_capacity, dtype=np.uint)
         self.comm_mask_buf = np.zeros(((local_buffer_capacity+1)*episode_capacity, configs.max_num_agents, configs.max_num_agents), dtype=np.bool)
 
+        wandb.define_metric("Episode")
+        wandb.define_metric("Gradient step")
+
+        wandb.define_metric("Goal acheivement", step_metric = "Episode")
+        wandb.define_metric("Reward", step_metric = "Episode")
+        wandb.define_metric("Loss", step_metric = "Gradient step")
 
     def __len__(self):
         return self.size
@@ -265,6 +299,19 @@ class GlobalBuffer:
                 return False
             
         return True
+    
+    def log(self, logs):
+        wandb.log(logs)
+
+    def log_layout(self, obstacles, agents_pos, goals_pos, distance_maps, episode, env):
+        prefix = "/home/dvasilev/heuristics/distance_heatmap"
+        layout = draw_layout(obstacles, agents_pos, goals_pos)
+        draw_distance("/home/dvasilev/heuristics/distance_heatmap", distance_maps)
+        logs = {"Layout": wandb.Image(layout), "Episode": episode}
+        for image_name in os.listdir(prefix):
+            distance_map = wandb.Image(prefix+"/"+image_name)
+            logs[image_name] = distance_map
+        wandb.log(logs)
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class Learner:
@@ -326,6 +373,7 @@ class Learner:
 
                 loss = (weights * self.huber_loss(td_error)).mean()
                 self.loss += loss.item()
+                self.buffer.log.remote({"Loss": self.loss, "Gradient step": self.counter})
 
                 self.optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -371,13 +419,16 @@ class Learner:
         return self.done
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1,)
 class Actor:
     def __init__(self, worker_id: int, epsilon: float, learner: Learner, buffer: GlobalBuffer):
         self.id = worker_id
         self.model = Network()
         self.model.eval()
-        pogema_env = pogema_v0(grid_config = Easy16x16())
+        grid_config = Hard8x8(on_target="nothing")
+        grid_config.obs_radius = configs.obs_radius
+        grid_config.num_agents = configs.num_agents
+        pogema_env = pogema_v0(grid_config = grid_config)
         # TEMPORARY: NO CURRICULUM
         self.env = DHC_wrapper(pogema_env)
         self.epsilon = epsilon
@@ -389,7 +440,7 @@ class Actor:
     def run(self):
         done = False
         obs, pos, local_buffer = self.reset()
-        
+        mean_rewards, episode, successes, total_steps = [], 0, np.array([False for i in range(configs.num_agents)]), 0
         while True:
 
             # sample action
@@ -403,6 +454,9 @@ class Actor:
             # return data and update observation
             local_buffer.add(q_val[0], actions[0], rewards[0], next_obs, hidden, comm_mask)
 
+            mean_rewards.append(np.array(rewards).mean())
+            successes = (np.array(rewards)>-0.001) | (successes)
+
             if done == False and self.env.steps < self.max_episode_length:
                 obs, pos = next_obs, next_pos
             else:
@@ -414,8 +468,16 @@ class Actor:
                     data = local_buffer.finish(q_val[0], comm_mask)
 
                 self.global_buffer.add.remote(data)
+                logs = {"Episode": episode, "Reward": np.array(mean_rewards).mean(), "Successes": successes.sum()}
+                episode, successes, mean_rewards = episode+1, np.array([False for i in range(configs.num_agents)]), []
+                self.global_buffer.log.remote(logs)
                 done = False
                 obs, pos, local_buffer = self.reset()
+
+                if episode%25 == 0:
+                    self.global_buffer.log_layout.remote(self.env.obstacles, self.env.get_agents_xy(), 
+                                                     self.env.get_targets_xy(), self.env.dist_map, episode=episode, 
+                                                     env=self.env.pogema_env)
 
             self.counter += 1
             if self.counter == configs.actor_update_steps:
@@ -433,9 +495,9 @@ class Actor:
         # new_env_settings_set = ray.get(self.global_buffer.get_env_settings.remote())
         # self.env.update_env_settings_set(ray.get(new_env_settings_set))
     
-    def reset(self):
+    def reset(self, seed=None):
         self.model.reset()
-        obs, pos = self.env.reset()
-        local_buffer = LocalBuffer(self.id, self.env.num_agents, self.env.map_size[0], obs)
+        obs, pos = self.env.reset(seed=seed)
+        local_buffer = LocalBuffer(self.id, self.env.num_agents, self.env.map_size[0], obs, obs_shape=obs.shape[-3:])
         return obs, pos, local_buffer
 

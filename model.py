@@ -121,7 +121,7 @@ class Network(nn.Module):
         super().__init__()
 
         self.input_shape = input_shape
-        self.latent_dim = 16*7*7
+        self.latent_dim = 784 # 16*7*7
         self.hidden_dim = hidden_dim
         self.max_comm_agents = max_comm_agents
 
