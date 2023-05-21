@@ -12,11 +12,10 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.cuda.amp import GradScaler
 import numpy as np
 from model import Network
-from environment import Environment
 from DHC_wrapper import DHC_wrapper, INFINITY
 from buffer import SumTree, LocalBuffer
 import configs
-from pogema import pogema_v0, Easy16x16, Normal8x8, Hard8x8
+from pogema import pogema_v0, Normal8x8, Hard8x8
 import wandb
 import cv2
 import seaborn as sns
@@ -41,7 +40,7 @@ def draw_layout(obstacles, agents_pos, goals_pos):
 
 def draw_distance(prefix, distance_maps):
     for i, dist_map in enumerate(distance_maps):
-        mask = (dist_map==INFINITY)
+        mask = (dist_map == INFINITY)
         fig = sns.heatmap(dist_map, mask=mask).get_figure()
         fig.savefig(prefix+"/Dist map of agent {}".format(i))
         fig.clf()
@@ -53,6 +52,8 @@ class GlobalBuffer:
                 alpha=configs.prioritized_replay_alpha, beta=configs.prioritized_replay_beta):
         
         wandb.init()
+
+        self.episode = 0
 
         self.capacity = episode_capacity
         self.local_buffer_capacity = local_buffer_capacity
@@ -81,9 +82,12 @@ class GlobalBuffer:
         wandb.define_metric("Episode")
         wandb.define_metric("Gradient step")
 
-        wandb.define_metric("Goal acheivement", step_metric = "Episode")
-        wandb.define_metric("Reward", step_metric = "Episode")
-        wandb.define_metric("Loss", step_metric = "Gradient step")
+        wandb.define_metric("Goal achievement", step_metric="Episode")
+        wandb.define_metric("Reward", step_metric="Episode")
+        wandb.define_metric("Target achievements", step_metric="Episode")
+        wandb.define_metric("Episode length", step_metric="Episode")
+        wandb.define_metric("Mission complete", step_metric="Episode")
+        wandb.define_metric("Loss", step_metric="Gradient step")
 
     def __len__(self):
         return self.size
@@ -301,17 +305,25 @@ class GlobalBuffer:
         return True
     
     def log(self, logs):
+        if "Loss" not in logs:
+            logs["Episode"] = self.episode
+            self.episode += 1
         wandb.log(logs)
 
-    def log_layout(self, obstacles, agents_pos, goals_pos, distance_maps, episode, env):
-        prefix = "/home/dvasilev/heuristics/distance_heatmap"
+    def log_layout(self, obstacles, agents_pos, goals_pos, distance_maps):
+        current_folder = os.path.dirname(os.path.realpath(__file__))
+        prefix = current_folder+"/distance_heatmap"
         layout = draw_layout(obstacles, agents_pos, goals_pos)
-        draw_distance("/home/dvasilev/heuristics/distance_heatmap", distance_maps)
-        logs = {"Layout": wandb.Image(layout), "Episode": episode}
+        draw_distance(current_folder+"/distance_heatmap", distance_maps)
+        logs = {"Layout": wandb.Image(layout)}
         for image_name in os.listdir(prefix):
             distance_map = wandb.Image(prefix+"/"+image_name)
             logs[image_name] = distance_map
         wandb.log(logs)
+
+    def log_video(self, video_array):
+        print("Video shape before sending: {}".format(video_array.shape))
+        wandb.log({"Agent evaluation": wandb.Video(video_array, format="gif")})
 
 @ray.remote(num_cpus=1, num_gpus=1)
 class Learner:
@@ -428,19 +440,21 @@ class Actor:
         grid_config = Hard8x8(on_target="nothing")
         grid_config.obs_radius = configs.obs_radius
         grid_config.num_agents = configs.num_agents
-        pogema_env = pogema_v0(grid_config = grid_config)
+        grid_config.max_episode_steps = configs.max_episode_length
+        pogema_env = pogema_v0(grid_config=grid_config)
         # TEMPORARY: NO CURRICULUM
         self.env = DHC_wrapper(pogema_env)
         self.epsilon = epsilon
         self.learner = learner
         self.global_buffer = buffer
-        self.max_episode_length = configs.max_episode_length
+        self.max_episode_length = grid_config.max_episode_steps
         self.counter = 0
 
     def run(self):
         done = False
         obs, pos, local_buffer = self.reset()
-        mean_rewards, episode, successes, total_steps = [], 0, np.array([False for i in range(configs.num_agents)]), 0
+        mean_rewards, episode, successes = [], 0, np.array([False for i in range(configs.num_agents)])
+        video = []
         while True:
 
             # sample action
@@ -455,7 +469,26 @@ class Actor:
             local_buffer.add(q_val[0], actions[0], rewards[0], next_obs, hidden, comm_mask)
 
             mean_rewards.append(np.array(rewards).mean())
-            successes = (np.array(rewards)>-0.001) | (successes)
+            successes = (np.array(rewards) > -0.001) | (successes)
+            print("Length of a video: {}".format(len(video)))
+            if episode % 250 == 0:
+                layout = draw_layout(self.env.obstacles, self.env.get_agents_xy(), self.env.get_targets_xy())
+                video.append(layout.transpose(2, 0, 1)*255)
+
+            if done or self.env.steps >= self.max_episode_length:
+                logs = {"Reward": self.env.get_mean_reward(),
+                        "Target achievements": self.env.quantity_of_achieved_goals(),
+                        "Episode length": self.env.steps,
+                        "Mission complete": self.env.mission_complete()}
+                successes, mean_rewards = np.array([False for i in range(configs.num_agents)]), []
+                self.global_buffer.log.remote(logs)
+
+                if episode % 250 == 0:
+                    video = np.stack(video, axis=0)
+                    print("Logged video length: {}".format(video.shape))
+                    self.global_buffer.log_video.remote(video)
+                    video = []
+                episode += 1
 
             if done == False and self.env.steps < self.max_episode_length:
                 obs, pos = next_obs, next_pos
@@ -468,16 +501,11 @@ class Actor:
                     data = local_buffer.finish(q_val[0], comm_mask)
 
                 self.global_buffer.add.remote(data)
-                logs = {"Episode": episode, "Reward": np.array(mean_rewards).mean(), "Successes": successes.sum()}
-                episode, successes, mean_rewards = episode+1, np.array([False for i in range(configs.num_agents)]), []
-                self.global_buffer.log.remote(logs)
                 done = False
                 obs, pos, local_buffer = self.reset()
-
-                if episode%25 == 0:
-                    self.global_buffer.log_layout.remote(self.env.obstacles, self.env.get_agents_xy(), 
-                                                     self.env.get_targets_xy(), self.env.dist_map, episode=episode, 
-                                                     env=self.env.pogema_env)
+                if episode % 250 == 0:
+                    self.global_buffer.log_layout.remote(self.env.obstacles, self.env.get_agents_xy(),
+                                                     self.env.get_targets_xy(), self.env.dist_map)
 
             self.counter += 1
             if self.counter == configs.actor_update_steps:
@@ -500,4 +528,3 @@ class Actor:
         obs, pos = self.env.reset(seed=seed)
         local_buffer = LocalBuffer(self.id, self.env.num_agents, self.env.map_size[0], obs, obs_shape=obs.shape[-3:])
         return obs, pos, local_buffer
-

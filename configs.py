@@ -33,7 +33,7 @@ batch_size=192
 learning_starts=50000
 target_network_update_freq=2000
 save_path='./models'
-max_episode_length = 256
+max_episode_length = 64
 seq_len = 16
 load_model = None
 

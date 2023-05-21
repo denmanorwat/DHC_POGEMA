@@ -3,3 +3,7 @@ __pycache__
 videos/*
 wandb/
 distance_heatmap/
+Hard medium/
+Hard small/
+Normal medium/
+Normal small/
